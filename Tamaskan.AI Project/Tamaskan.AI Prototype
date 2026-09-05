@@ -1,0 +1,131 @@
+import time
+import pandas as pd
+import sklearn
+from scapy.all import sniff, IP, TCP, UDP
+from sklearn.ensemble import IsolationForest
+
+# Dictionary to hold our flow statistics
+flows = {}
+
+def get_flow_id(packet):
+    """Creates a unique string ID for a network connection."""
+    if IP in packet:
+        src_ip = packet[IP].src
+        dst_ip = packet[IP].dst
+        proto = packet[IP].proto
+        
+        src_port, dst_port = 0, 0
+        if TCP in packet:
+            src_port = packet[TCP].sport
+            dst_port = packet[TCP].dport
+        elif UDP in packet:
+            src_port = packet[UDP].sport
+            dst_port = packet[UDP].dport
+            
+        # Sort so A->B and B->A are treated as the same flow
+        endpoints = sorted([f"{src_ip}:{src_port}", f"{dst_ip}:{dst_port}"])
+        return f"{endpoints[0]} <-> {endpoints[1]} [{proto}]"
+    return None
+
+def process_offline_packet(packet):
+    """Analyzes a single packet from the PCAP file."""
+    flow_id = get_flow_id(packet)
+    
+    if flow_id:
+        # If it's a new flow, initialize its stats
+        if flow_id not in flows:
+            flows[flow_id] = {
+                'packet_count': 0,
+                'total_bytes': 0,
+                'start_time': float(packet.time), # Use packet's timestamp, not current time!
+                'end_time': float(packet.time)
+            }
+            
+        # Update the stats
+        flows[flow_id]['packet_count'] += 1
+        flows[flow_id]['total_bytes'] += len(packet)
+        flows[flow_id]['end_time'] = float(packet.time)
+
+# --- Main Execution ---
+
+# 1. Provide the path to your Wireshark file here
+PCAP_FILE = " " 
+
+print(f"Reading {PCAP_FILE}...")
+try:
+    # sniff() can read offline files! store=0 keeps RAM usage low.
+    sniff(offline=PCAP_FILE, prn=process_offline_packet, store=0)
+    print("PCAP processing complete. Calculating AI features...")
+    
+    # 2. Translate raw stats into AI features
+    ai_data = []
+    for flow_id, stats in flows.items():
+        duration = stats['end_time'] - stats['start_time']
+        if duration == 0:
+            duration = 0.001 # Prevent division by zero
+            
+        ai_data.append({
+            'Flow ID': flow_id,
+            'Packets': stats['packet_count'],
+            'Bytes': stats['total_bytes'],
+            'Duration (s)': round(duration, 4),
+            'Bytes/Sec': round(stats['total_bytes'] / duration, 2),
+            'Pkts/Sec': round(stats['packet_count'] / duration, 2),
+            'Avg Packet Size': round(stats['total_bytes'] / stats['packet_count'], 2)
+        })
+        
+    # 3. Create the Pandas DataFrame
+    df = pd.DataFrame(ai_data)
+    
+    # Display the top 5 largest flows
+    print("\nTop 5 Flows by Byte Count:")
+    print(df.sort_values(by="Bytes", ascending=False).head(5).to_string())
+
+    print("\nInitializing AI Anomaly Detector...")
+
+    # 4. Isolate the exact math features the AI needs to look at.
+    # We drop 'Flow ID' because the AI only understands numbers, not text.
+    features_for_ai = df[[
+        'Packets', 
+        'Bytes', 
+        'Duration (s)', 
+        'Bytes/Sec', 
+        'Pkts/Sec', 
+        'Avg Packet Size'
+    ]]
+
+    # 5. Build the Model (The Brain)
+    # contamination=0.05 means we are telling the AI: "Assume about 5% of this traffic is weird/anomalous."
+    print("Training the AI on your network data...")
+    ai_model = IsolationForest(n_estimators=100, contamination=0.05, random_state=42)
+
+    # 6. Train the model on your data! 
+    ai_model.fit(features_for_ai)
+    print("Training complete!")
+
+    # 7. Ask the AI to score the traffic it just learned from.
+    # Isolation Forest returns: 1 for "Normal" and -1 for "Anomaly"
+    predictions = ai_model.predict(features_for_ai)
+
+    # 8. Attach the results back to our readable DataFrame
+    df['AI_Verdict'] = predictions
+
+    # Convert the 1 and -1 into human-readable labels
+    df['Status'] = df['AI_Verdict'].map({1: 'Normal', -1: '🚨 ANOMALY'})
+
+    # 9. Show the results! Let's look at the anomalies first.
+    anomalies = df[df['Status'] == '🚨 ANOMALY']
+
+    print("\n" + "="*60)
+    print(f"TAMASKAN AI: Found {len(anomalies)} anomalies out of {len(df)} total flows.")
+    print("="*60)
+
+    if not anomalies.empty:
+        # Display the anomalous flows
+        print(anomalies[['Flow ID', 'Packets', 'Bytes', 'Avg Packet Size', 'Status']].sort_values(by='Bytes', ascending=False).to_string())
+    else:
+        print("No anomalies detected! All traffic looks uniform.")
+
+except FileNotFoundError:
+    print(f"\n[ERROR] Could not find the file '{PCAP_FILE}'.")
+    print("Please capture some traffic in Wireshark, save it as a .pcap, and put it in the same folder as this script.")
