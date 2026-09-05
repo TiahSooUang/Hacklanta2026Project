@@ -1,0 +1,5 @@
+customtkinter
+scapy
+scikit-learn
+pandas
+pyinstaller
